@@ -7,9 +7,13 @@ import { handleApiError } from "@/lib/errorHandler";
  * Provides type-safe interfaces for all backend operations including
  * project management, agent execution, and Claude Code integration.
  */
-import { getApiModel, type ClaudeModel } from "@/types/models";
+import { getApiModel, type ClaudeModel, type ClaudeModelInfo } from "@/types/models";
 import type { HooksConfiguration } from "@/types/hooks";
 import { HooksManager } from "@/lib/hooksManager";
+
+// Session-level cache for Claude models to avoid repeated CLI parsing in one app run
+let claudeModelsCache: ClaudeModelInfo[] | null = null;
+let claudeModelsPromise: Promise<ClaudeModelInfo[]> | null = null;
 
 /** Process type for tracking in ProcessRegistry */
 export type ProcessType =
@@ -636,6 +640,33 @@ export const api = {
     } catch (error) {
       logger.error("Failed to save Claude settings:", error);
       throw error;
+    }
+  },
+
+  /**
+   * Get Claude models by invoking /model from the CLI
+   */
+  async getClaudeModels(): Promise<ClaudeModelInfo[]> {
+    // Return cached result if available
+    if (claudeModelsCache) {
+      return claudeModelsCache;
+    }
+
+    // If a request is already in flight, reuse it
+    if (claudeModelsPromise) {
+      return claudeModelsPromise;
+    }
+
+    try {
+      claudeModelsPromise = invoke<ClaudeModelInfo[]>("get_claude_models");
+      const models = await claudeModelsPromise;
+      claudeModelsCache = models;
+      return models;
+    } catch (error) {
+      logger.error("Failed to get Claude models:", error);
+      throw error;
+    } finally {
+      claudeModelsPromise = null;
     }
   },
 

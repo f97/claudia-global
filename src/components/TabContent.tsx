@@ -114,6 +114,44 @@ const TabPanel: React.FC<TabPanelProps> = ({ tab, isActive }) => {
   // Panel visibility - keep all panels rendered but only show active one
   const panelVisibilityClass = "";
 
+  // When a chat tab switches back to projects, preselect and load that project's sessions
+  useEffect(() => {
+    const session = tab.sessionData as Session | undefined;
+
+    // Only run when this tab is active, is in projects view, and we have a session's project to return to
+    if (
+      isActive &&
+      tab.type === "projects" &&
+      session?.project_id &&
+      session?.project_path &&
+      selectedProject?.id !== session.project_id
+    ) {
+      const preloadProject = async () => {
+        try {
+          setLoading(true);
+          setError(null);
+          const sessionList = await api.getProjectSessions(session.project_id);
+          setSessions(sessionList);
+
+          // Preselect the project inferred from the session (minimal fields are sufficient for SessionList)
+          setSelectedProject({
+            id: session.project_id,
+            path: session.project_path,
+            sessions: [],
+            created_at: 0,
+          });
+        } catch (err) {
+          await handleError("Failed to load sessions:", { context: err });
+          setError("Failed to load sessions for this project.");
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      preloadProject();
+    }
+  }, [isActive, tab.type, tab.sessionData, selectedProject?.id, selectedProject?.path]);
+
   const renderContent = () => {
     switch (tab.type) {
       case "projects":
@@ -159,7 +197,14 @@ const TabPanel: React.FC<TabPanelProps> = ({ tab, isActive }) => {
                         sessions={sessions}
                         projectPath={selectedProject.path}
                         projectId={selectedProject.id}
-                        onBack={handleBack}
+                        onBack={() => {
+                          handleBack();
+                          // Clear session context so returning to project list won't auto-reopen the same project's sessions
+                          updateTab(tab.id, {
+                            sessionData: undefined,
+                            initialProjectPath: undefined,
+                          });
+                        }}
                         onSessionClick={(session) => {
                           // Create a new chat tab instead of modifying the current projects tab
                           const projectName = session.project_path.split("/").pop() || "Session";
@@ -254,10 +299,12 @@ const TabPanel: React.FC<TabPanelProps> = ({ tab, isActive }) => {
             session={tab.sessionData as Session} // Pass the full session object if available
             initialProjectPath={tab.initialProjectPath || (tab.sessionData as Session)?.project_path || ""}
             onBack={() => {
-              // Go back to projects view in the same tab
+              // Go back to projects view in the same tab and preselect the originating project
+              const session = tab.sessionData as Session | undefined;
+              const projectName = session?.project_path?.split("/").pop() || t.projects.title;
               updateTab(tab.id, {
                 type: "projects",
-                title: t.projects.title,
+                title: projectName || t.projects.title,
               });
             }}
           />

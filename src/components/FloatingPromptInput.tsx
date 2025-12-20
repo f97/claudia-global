@@ -9,9 +9,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { FilePicker } from "./FilePicker";
 import { SlashCommandPicker } from "./SlashCommandPicker";
 import { ImagePreview } from "./ImagePreview";
-import { useI18n } from "@/lib/i18n";
-import { type FileEntry, type SlashCommand } from "@/lib/api";
-import { type ClaudeModel } from "@/types/models";
+import { api, type FileEntry, type SlashCommand } from "@/lib/api";
+import { getDefaultModel, type ClaudeModel } from "@/types/models";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { logger } from "@/lib/logger";
 
@@ -126,11 +125,21 @@ const ThinkingModeIndicator: React.FC<{ level: number }> = ({ level }) => {
   );
 };
 
+/**
+ * Model type for model picker
+ */
 type Model = {
   id: ClaudeModel;
   name: string;
   description: string;
   icon: React.ReactNode;
+};
+
+const resolveIcon = (id: string) => {
+  const lower = id.toLowerCase();
+  if (lower.includes("haiku")) return <Zap className="h-4 w-4" />;
+  if (lower.includes("opus")) return <Sparkles className="h-4 w-4" />;
+  return <Brain className="h-4 w-4" />;
 };
 
 /**
@@ -184,73 +193,36 @@ const FloatingPromptInputInner = (
     onSend,
     isLoading = false,
     disabled = false,
-    defaultModel = "sonnet-3-5",
+    defaultModel = getDefaultModel(),
     projectPath,
     className,
     onCancel,
   }: FloatingPromptInputProps,
   ref: React.Ref<FloatingPromptInputRef>
 ) => {
-  const { t } = useI18n();
-
-  const MODELS: Model[] = [
-    {
-      id: "haiku",
-      name: t.agents.claude35Haiku,
-      description: t.agents.fastAffordable,
-      icon: <Zap className="h-4 w-4" />,
-    },
-    {
-      id: "sonnet-3-5",
-      name: t.agents.claude35Sonnet,
-      description: t.agents.balancedPerformance,
-      icon: <Sparkles className="h-4 w-4" />,
-    },
-    {
-      id: "sonnet-3-7",
-      name: t.agents.claude37Sonnet,
-      description: t.agents.advancedReasoning,
-      icon: <Brain className="h-4 w-4" />,
-    },
-    {
-      id: "claude-3-7-sonnet-20250219-thinking",
-      name: "Claude 3.7 Sonnet (Thinking)",
-      description: t.agents.claude37SonnetThinkingDesc,
-      icon: <Brain className="h-4 w-4" />,
-    },
+  const fallbackModels: Model[] = [
     {
       id: "sonnet",
-      name: t.agents.claude4Sonnet,
-      description: t.agents.fasterEfficient,
-      icon: <Zap className="h-4 w-4" />,
-    },
-    {
-      id: "claude-sonnet-4-20250514-thinking",
-      name: "Claude 4 Sonnet (Thinking)",
-      description: t.agents.claude4SonnetThinkingDesc,
+      name: "Sonnet",
+      description: "Default Claude model",
       icon: <Brain className="h-4 w-4" />,
     },
     {
       id: "opus",
-      name: t.agents.claude4Opus,
-      description: t.agents.moreCapable,
+      name: "Opus",
+      description: "Most capable model",
       icon: <Sparkles className="h-4 w-4" />,
     },
     {
-      id: "claude-opus-4-20250514-thinking",
-      name: "Claude 4 Opus (Thinking)",
-      description: t.agents.claude4OpusThinkingDesc,
-      icon: <Brain className="h-4 w-4" />,
-    },
-    {
-      id: "claude-opus-4-1-20250805",
-      name: "Claude Opus 4.1",
-      description: "Enhanced reasoning capabilities with improved performance",
-      icon: <Sparkles className="h-4 w-4" />,
+      id: "haiku",
+      name: "Haiku",
+      description: "Fastest model",
+      icon: <Zap className="h-4 w-4" />,
     },
   ];
 
   const [prompt, setPrompt] = useState("");
+  const [models, setModels] = useState<Model[]>(fallbackModels);
   const [selectedModel, setSelectedModel] = useState<ClaudeModel>(defaultModel);
   const [selectedThinkingMode, setSelectedThinkingMode] = useState<ThinkingMode>("auto");
   const [isExpanded, setIsExpanded] = useState(false);
@@ -262,7 +234,43 @@ const FloatingPromptInputInner = (
   const [slashCommandQuery, setSlashCommandQuery] = useState("");
   const [cursorPosition, setCursorPosition] = useState(0);
   const [embeddedImages, setEmbeddedImages] = useState<string[]>([]);
+  const [pastedImages, setPastedImages] = useState<{ token: string; dataUrl: string }[]>([]);
   const [dragActive, setDragActive] = useState(false);
+  const [hasUserPickedModel, setHasUserPickedModel] = useState(false);
+
+  // Load models from CLI (/model) and set default
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const remote = await api.getClaudeModels();
+        if (!mounted || !Array.isArray(remote) || remote.length === 0) {
+          return;
+        }
+        const mapped: Model[] = remote.map((m) => ({
+          id: m.id as ClaudeModel,
+          name: m.name || m.id,
+          description: m.description || "",
+          icon: resolveIcon(m.id),
+        }));
+        setModels(mapped);
+
+        if (!hasUserPickedModel) {
+          const defaultFromApi =
+            remote.find((m) => m.is_default)?.id ||
+            remote[0]?.id ||
+            defaultModel;
+          setSelectedModel(defaultFromApi as ClaudeModel);
+        }
+      } catch (err) {
+        logger.warn("Failed to load models from CLI:", err);
+        // fallback models already set as initial state
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [defaultModel, hasUserPickedModel]);
 
   const textareaRef = useRef<globalThis.HTMLTextAreaElement>(null);
   const expandedTextareaRef = useRef<globalThis.HTMLTextAreaElement>(null);
@@ -380,13 +388,26 @@ const FloatingPromptInputInner = (
     [projectPath]
   );
 
-  // Update embedded images when prompt changes
+  // Update embedded images when prompt or pasted images change
   useEffect(() => {
     logger.debug("[useEffect] Prompt changed:", prompt);
     const imagePaths = extractImagePaths(prompt);
-    logger.debug("[useEffect] Setting embeddedImages to:", imagePaths);
-    setEmbeddedImages(imagePaths);
-  }, [prompt, projectPath, extractImagePaths]);
+
+    // Keep pasted images only if their placeholder still exists in the prompt
+    setPastedImages((prev) => {
+      const filtered = prev.filter((img) => prompt.includes(`@${img.token}`));
+      // Avoid triggering state updates if nothing changed
+      if (filtered.length === prev.length) {
+        return prev;
+      }
+      return filtered;
+    });
+
+    const combinedImages = [...pastedImages.map((img) => img.dataUrl), ...imagePaths];
+
+    logger.debug("[useEffect] Setting embeddedImages to combined:", combinedImages.length);
+    setEmbeddedImages(combinedImages);
+  }, [prompt, projectPath, extractImagePaths, pastedImages]);
 
   // Set up Tauri drag-drop event listener
   useEffect(() => {
@@ -774,10 +795,15 @@ const FloatingPromptInputInner = (
           reader.onload = () => {
             const base64Data = reader.result as string;
 
-            // Add the base64 data URL directly to the prompt
-            setPrompt((currentPrompt) => {
-              // Use the data URL directly as the image reference
-              const mention = `@"${base64Data}"`;
+            // Use a short placeholder token to avoid flooding the textarea
+            setPrompt((currentPrompt: string) => {
+              let token = "";
+              setPastedImages((prev) => {
+                token = `image-${prev.length + 1}`;
+                return [...prev, { token, dataUrl: base64Data }];
+              });
+
+              const mention = `@${token}`;
               const newPrompt = `${currentPrompt}${currentPrompt.endsWith(" ") || currentPrompt === "" ? "" : " "}${mention} `;
 
               // Focus the textarea and move cursor to end
@@ -824,17 +850,24 @@ const FloatingPromptInputInner = (
    * @param index - Index of the image to remove
    */
   const handleRemoveImage = (index: number) => {
-    // Remove the corresponding @mention from the prompt
-    const imagePath = embeddedImages[index];
+    // Build the same ordering used for preview: pasted images first, then path images
+    const pathImages = extractImagePaths(prompt);
+    const combined = [
+      ...pastedImages.map((img) => ({ type: "pasted" as const, token: img.token, src: img.dataUrl })),
+      ...pathImages.map((path) => ({ type: "path" as const, path, src: path })),
+    ];
 
-    // For data URLs, we need to handle them specially since they're always quoted
-    if (imagePath.startsWith("data:")) {
-      // Simply remove the exact quoted data URL
-      const quotedPath = `@"${imagePath}"`;
-      const newPrompt = prompt.replace(quotedPath, "").trim();
-      setPrompt(newPrompt);
+    const target = combined[index];
+    if (!target) return;
+
+    if (target.type === "pasted") {
+      const mention = `@${target.token}`;
+      setPrompt((prev) => prev.replace(mention, "").trim());
+      setPastedImages((prev) => prev.filter((img) => img.token !== target.token));
       return;
     }
+
+    const imagePath = target.path;
 
     // For file paths, use the original logic
     const escapedPath = imagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -862,7 +895,10 @@ const FloatingPromptInputInner = (
     setPrompt(newPrompt.trim());
   };
 
-  const selectedModelData = MODELS.find((m) => m.id === selectedModel) || MODELS[0];
+  const selectedModelData =
+    models.find((m) => m.id === selectedModel) ||
+    models[0] ||
+    fallbackModels[0];
 
   return (
     <>
@@ -1068,11 +1104,12 @@ const FloatingPromptInputInner = (
                 }
                 content={
                   <div className="w-[300px] p-1">
-                    {MODELS.map((model) => (
+                    {models.map((model) => (
                       <button
                         key={model.id}
                         onClick={() => {
                           setSelectedModel(model.id);
+                          setHasUserPickedModel(true);
                           setModelPickerOpen(false);
                         }}
                         className={cn(

@@ -24,7 +24,8 @@ export type ClaudeModel =
   | "opus" // Legacy Claude 4 Opus alias
   | "haiku" // Claude 3.5 Haiku shorthand
   | "sonnet-3-5" // Claude 3.5 Sonnet shorthand
-  | "sonnet-3-7"; // Claude 3.7 Sonnet shorthand
+  | "sonnet-3-7" // Claude 3.7 Sonnet shorthand
+  | (string & {}); // Allow future/unknown model identifiers at runtime
 
 /**
  * Model configuration interface
@@ -57,43 +58,6 @@ export interface ModelConfig {
   category: "legacy" | "current";
   /** Performance characteristics of the model */
   performance: "fast" | "balanced" | "powerful";
-}
-
-/**
- * Model display names mapping
- */
-export const MODEL_DISPLAY_NAMES: Record<ClaudeModel, string> = {
-  "claude-3-5-haiku-20241022": "Claude 3.5 Haiku",
-  "claude-3-5-sonnet-20241022": "Claude 3.5 Sonnet",
-  "claude-3-7-sonnet-20250219": "Claude 3.7 Sonnet",
-  "claude-sonnet-4-20250514-thinking": "Claude 4 Sonnet (Thinking)",
-  "claude-opus-4-20250514-thinking": "Claude 4 Opus (Thinking)",
-  "claude-opus-4-1-20250805": "Claude Opus 4.1",
-  "claude-3-7-sonnet-20250219-thinking": "Claude 3.7 Sonnet (Thinking)",
-  sonnet: "Claude 4 Sonnet",
-  opus: "Claude 4 Opus",
-  haiku: "Claude 3.5 Haiku",
-  "sonnet-3-5": "Claude 3.5 Sonnet",
-  "sonnet-3-7": "Claude 3.7 Sonnet",
-};
-
-/**
- * Get display name for a model
- *
- * Converts a model identifier to its human-readable display name.
- * Falls back to the original model string if no mapping exists.
- *
- * @param model - The Claude model identifier
- * @returns Human-readable display name
- *
- * @example
- * ```tsx
- * getModelDisplayName("sonnet-3-5") // Returns: "Claude 3.5 Sonnet"
- * getModelDisplayName("claude-3-5-haiku-20241022") // Returns: "Claude 3.5 Haiku"
- * ```
- */
-export function getModelDisplayName(model: ClaudeModel): string {
-  return MODEL_DISPLAY_NAMES[model] || model;
 }
 
 /**
@@ -152,4 +116,20 @@ export const MODEL_API_MAPPING: Record<ClaudeModel, string> = {
  */
 export function getApiModel(model: ClaudeModel): string {
   return MODEL_API_MAPPING[model] || model;
+}
+
+/**
+ * Returns the default Claude model.
+ * This is used as a fallback when CLI model fetch fails.
+ * The actual default is determined by the CLI /model command.
+ */
+export function getDefaultModel(): ClaudeModel {
+  return "sonnet";
+}
+
+export interface ClaudeModelInfo {
+  id: ClaudeModel;
+  name: string;
+  description: string;
+  is_default: boolean;
 }

@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::SystemTime;
+use tokio::time::{timeout, Duration};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -100,6 +102,401 @@ pub struct ClaudeVersionStatus {
     pub version: Option<String>,
     /// The full output from the command
     pub output: String,
+}
+
+/// Model info returned from /model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeModelInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub is_default: bool,
+}
+
+/// Get Claude models by spawning an interactive PTY session and sending /model command.
+#[tauri::command]
+pub async fn get_claude_models(app: AppHandle) -> Result<Vec<ClaudeModelInfo>, String> {
+    log::info!("[get_claude_models] Fetching models via interactive PTY...");
+    
+    let claude_path = find_claude_binary(&app)?;
+    
+    // Run the PTY interaction in a blocking task
+    let models = tokio::task::spawn_blocking(move || {
+        fetch_models_via_pty(&claude_path)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+    
+    match models {
+        Ok(m) if !m.is_empty() => {
+            log::info!("[get_claude_models] Successfully fetched {} models from CLI", m.len());
+            Ok(m)
+        }
+        Ok(_) | Err(_) => {
+            log::warn!("[get_claude_models] Failed to fetch models, using fallback");
+            Ok(get_fallback_models())
+        }
+    }
+}
+
+/// Fetch models using PTY to interact with Claude CLI
+fn fetch_models_via_pty(claude_path: &str) -> Result<Vec<ClaudeModelInfo>, String> {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    
+    let pty_system = native_pty_system();
+    
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 50,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("Failed to open PTY: {}", e))?;
+    
+    let mut cmd = CommandBuilder::new(claude_path);
+    // Start in current directory
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
+    
+    let mut child = pair.slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("Failed to spawn command: {}", e))?;
+    
+    // Drop slave to avoid blocking
+    drop(pair.slave);
+    
+    let mut reader = pair.master.try_clone_reader()
+        .map_err(|e| format!("Failed to clone reader: {}", e))?;
+    let mut writer = pair.master.take_writer()
+        .map_err(|e| format!("Failed to take writer: {}", e))?;
+    
+    // Wait for CLI to start
+    let start = Instant::now();
+    let timeout = Duration::from_secs(15);
+    let mut output = String::new();
+    let mut buf = [0u8; 8192];
+    
+    // Wait for initial output
+    std::thread::sleep(Duration::from_millis(3000));
+    
+    // Read initial output
+    loop {
+        if start.elapsed() > timeout {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                // Wait until we see the prompt
+                if output.contains("Try") && output.len() > 500 {
+                    std::thread::sleep(Duration::from_millis(500));
+                    // Read any remaining
+                    while let Ok(n) = reader.read(&mut buf) {
+                        if n == 0 { break; }
+                        output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if n < buf.len() { break; }
+                    }
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    
+    log::info!("[fetch_models_via_pty] Initial output length: {}", output.len());
+    
+    // First, try to extract model from initial output (e.g., "Sonnet 4.5 · API Usage Billing")
+    let initial_models = parse_initial_output(&output);
+    if !initial_models.is_empty() {
+        log::info!("[fetch_models_via_pty] Extracted {} models from initial output", initial_models.len());
+        // Send Ctrl+C to exit
+        writer.write_all(&[0x03]).ok();
+        writer.flush().ok();
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(initial_models);
+    }
+    
+    // Send /model command
+    log::info!("[fetch_models_via_pty] Sending /model command...");
+    writer.write_all(b"/model\n")
+        .map_err(|e| format!("Failed to write /model: {}", e))?;
+    writer.flush().ok();
+    
+    // Wait and read /model output
+    std::thread::sleep(Duration::from_millis(2000));
+    
+    let mut model_output = String::new();
+    let model_start = Instant::now();
+    loop {
+        if model_start.elapsed() > Duration::from_secs(8) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                model_output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                // Check if we have model list (look for numbered items)
+                if (model_output.contains("1.") && model_output.contains("2.")) ||
+                   model_output.contains("Default") {
+                    std::thread::sleep(Duration::from_millis(1000));
+                    // Read remaining
+                    while let Ok(n) = reader.read(&mut buf) {
+                        if n == 0 { break; }
+                        model_output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if n < buf.len() { break; }
+                    }
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    
+    log::info!("[fetch_models_via_pty] Model output length: {}", model_output.len());
+    log::debug!("[fetch_models_via_pty] Model output: {}", model_output);
+    
+    // Send ESC to cancel model selection
+    writer.write_all(&[0x1b]).ok();
+    writer.flush().ok();
+    std::thread::sleep(Duration::from_millis(200));
+    
+    // Send Ctrl+C to exit
+    writer.write_all(&[0x03]).ok();
+    writer.flush().ok();
+    std::thread::sleep(Duration::from_millis(200));
+    
+    // Kill the process
+    let _ = child.kill();
+    let _ = child.wait();
+    
+    // Parse models from /model output
+    let models = parse_model_output(&model_output);
+    Ok(models)
+}
+
+/// Parse initial CLI output to extract current model info
+fn parse_initial_output(output: &str) -> Vec<ClaudeModelInfo> {
+    let clean = strip_ansi_codes(output);
+    let mut models = Vec::new();
+    
+    // Look for pattern like "Sonnet 4.5 · API Usage Billing" or "Opus 4.5 · API"
+    // This tells us the current default model
+    let model_patterns = [
+        ("Sonnet", "sonnet"),
+        ("Opus", "opus"),
+        ("Haiku", "haiku"),
+    ];
+    
+    let mut current_model = None;
+    let mut current_version = String::new();
+    
+    for line in clean.lines() {
+        for (name, id) in &model_patterns {
+            if line.contains(name) && (line.contains("API") || line.contains("·")) {
+                // Extract version number if present
+                if let Some(idx) = line.find(name) {
+                    let rest = &line[idx..];
+                    let words: Vec<&str> = rest.split_whitespace().collect();
+                    if words.len() >= 2 {
+                        // Check if second word is a version number
+                        let maybe_version = words[1].trim_end_matches('·').trim();
+                        if maybe_version.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                            current_version = maybe_version.to_string();
+                        }
+                    }
+                    current_model = Some((*name, *id));
+                    break;
+                }
+            }
+        }
+        if current_model.is_some() {
+            break;
+        }
+    }
+    
+    // Build model list based on detected current model
+    if let Some((current_name, current_id)) = current_model {
+        let version_suffix = if !current_version.is_empty() {
+            format!(" {}", current_version)
+        } else {
+            String::new()
+        };
+        
+        // Add all three models, marking the current one as default
+        for (name, id) in &model_patterns {
+            let is_default = *id == current_id;
+            let display_name = format!("{}{}", name, version_suffix);
+            let description = match *id {
+                "sonnet" => {
+                    if !version_suffix.is_empty() {
+                        format!("Default model ({})", display_name)
+                    } else {
+                        "Default model".to_string()
+                    }
+                },
+                "opus" => "Most capable for complex work".to_string(),
+                "haiku" => "Fastest for quick answers".to_string(),
+                _ => String::new(),
+            };
+            
+            models.push(ClaudeModelInfo {
+                id: id.to_string(),
+                name: display_name,
+                description,
+                is_default,
+            });
+        }
+    }
+    
+    models
+}
+
+/// Parse /model command output to extract model info
+fn parse_model_output(output: &str) -> Vec<ClaudeModelInfo> {
+    let mut models = Vec::new();
+    
+    // Clean ANSI codes
+    let clean = strip_ansi_codes(output);
+    
+    log::debug!("[parse_model_output] Cleaned output: {}", clean);
+    
+    for line in clean.lines() {
+        let trimmed = line.trim();
+        
+        // Look for patterns like:
+        // "1. Default (recommended) ✔  Use the default model (currently Sonnet 4.5) · $3/$15 per Mtok"
+        // "2. Opus                     Opus 4.5 · Most capable for complex work · $5/$25 per Mtok"
+        // "3. Haiku                    Haiku 4.5 · Fastest for quick answers · $1/$5 per Mtok"
+        // Or: "❯ Default (recommended)"
+        
+        if let Some(idx) = trimmed.find(". ") {
+            let rest = &trimmed[idx + 2..];
+            // Split by multiple spaces
+            let parts: Vec<&str> = rest.split("  ")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            
+            if parts.is_empty() {
+                continue;
+            }
+            
+            let raw_name = parts[0]
+                .trim_start_matches('❯')
+                .trim_start_matches('✔')
+                .trim();
+            let description = parts.get(1).map(|s| s.to_string()).unwrap_or_default();
+            let is_default = trimmed.contains('✔') || raw_name.to_lowercase().contains("default");
+            
+            // Determine model ID
+            let id = if raw_name.to_lowercase().contains("default") {
+                "sonnet".to_string() // Default is typically Sonnet
+            } else if raw_name.to_lowercase().contains("opus") {
+                "opus".to_string()
+            } else if raw_name.to_lowercase().contains("haiku") {
+                "haiku".to_string()
+            } else {
+                raw_name.to_lowercase().split_whitespace().next().unwrap_or("sonnet").to_string()
+            };
+            
+            // Build display name
+            let name = if raw_name.to_lowercase().contains("default") {
+                // Extract actual model name from description if available
+                if description.contains("Sonnet") {
+                    format!("Default ({})", extract_model_version(&description, "Sonnet"))
+                } else {
+                    "Default (recommended)".to_string()
+                }
+            } else {
+                raw_name.to_string()
+            };
+            
+            models.push(ClaudeModelInfo {
+                id,
+                name,
+                description,
+                is_default,
+            });
+        }
+    }
+    
+    // Ensure exactly one default
+    if !models.iter().any(|m| m.is_default) && !models.is_empty() {
+        models[0].is_default = true;
+    }
+    
+    models
+}
+
+/// Strip ANSI escape codes from string
+fn strip_ansi_codes(s: &str) -> String {
+    let re = regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07").unwrap();
+    re.replace_all(s, "").to_string()
+}
+
+/// Extract model version from description (e.g., "Sonnet 4.5" from "currently Sonnet 4.5")
+fn extract_model_version(desc: &str, model_name: &str) -> String {
+    if let Some(idx) = desc.to_lowercase().find(&model_name.to_lowercase()) {
+        let start = idx;
+        let rest = &desc[start..];
+        // Take model name and version number
+        let words: Vec<&str> = rest.split_whitespace().take(2).collect();
+        words.join(" ")
+    } else {
+        model_name.to_string()
+    }
+}
+
+/// Fallback models when PTY fetch fails
+fn get_fallback_models() -> Vec<ClaudeModelInfo> {
+    vec![
+        ClaudeModelInfo {
+            id: "sonnet".to_string(),
+            name: "Sonnet".to_string(),
+            description: "Default Claude model".to_string(),
+            is_default: true,
+        },
+        ClaudeModelInfo {
+            id: "opus".to_string(),
+            name: "Opus".to_string(),
+            description: "Most capable model".to_string(),
+            is_default: false,
+        },
+        ClaudeModelInfo {
+            id: "haiku".to_string(),
+            name: "Haiku".to_string(),
+            description: "Fastest model".to_string(),
+            is_default: false,
+        },
+    ]
+}
+
+/// Represents an available Claude model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeModel {
+    /// Model identifier (e.g., "claude-3-5-sonnet-20241022")
+    pub id: String,
+    /// Display name (e.g., "Claude 3.5 Sonnet")
+    pub name: String,
+    /// Whether this is the latest/recommended model
+    pub is_latest: bool,
+    /// Model description or capabilities
+    pub description: Option<String>,
 }
 
 /// Represents a CLAUDE.md file found in the project

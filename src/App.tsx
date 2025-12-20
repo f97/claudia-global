@@ -30,7 +30,6 @@ import { ToastProvider } from "@/contexts/ToastContext";
 import { handleApiError } from "@/lib/errorHandler";
 import { logger } from "@/lib/logger";
 import { audioNotificationManager, loadAudioConfigFromLocalStorage } from "@/lib/audioNotification";
-import { AnalyticsConsentBanner } from "@/components/AnalyticsConsent";
 import { useAppLifecycle, useTrackEvent } from "@/hooks";
 
 type View =
@@ -562,9 +561,6 @@ function AppContent() {
         onInfoClick={() => setShowNFO(true)}
         onAgentsClick={() => setShowAgentsModal(true)}
       />
-
-      {/* Analytics Consent Banner */}
-      <AnalyticsConsentBanner />
 
       {/* Main Content */}
       <div className="flex-1 overflow-hidden">{renderContent()}</div>

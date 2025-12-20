@@ -27,7 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { api, type Agent } from "@/lib/api";
-import { type ClaudeModel } from "@/types/models";
+import { getDefaultModel, type ClaudeModel } from "@/types/models";
 import { cn } from "@/lib/utils";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -103,7 +103,9 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({ agent, onBack, c
   const { t } = useI18n();
   const [projectPath, setProjectPath] = useState("");
   const [task, setTask] = useState(agent.default_task || "");
-  const [model, setModel] = useState<ClaudeModel>((agent.model as ClaudeModel) || "sonnet-3-5");
+  const [model, setModel] = useState<ClaudeModel>(
+    (agent.model as ClaudeModel) || getDefaultModel()
+  );
   const [isRunning, setIsRunning] = useState(false);
   const [messages, setMessages] = useState<ClaudeStreamMessage[]>([]);
   const [rawJsonlOutput, setRawJsonlOutput] = useState<string[]>([]);
